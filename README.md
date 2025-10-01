@@ -28,3 +28,10 @@ docker run --rm -it --gpus all --ipc=host -p 8000:8000 \
   --max-model-len 128 \
   --max-num-seqs 2
 ```
+
+Check the server is working with a simple call:
+```
+curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
+  -F "file=@path/to/file.wav" \
+  -F "model=openai/whisper-large-v3-turbo"
+```
