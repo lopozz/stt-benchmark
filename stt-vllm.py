@@ -5,25 +5,46 @@ import aiohttp
 import argparse
 from pathlib import Path
 import tempfile
+import sys
 
 import soundfile as sf
 from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
 
-DEFAULT_URL = "http://localhost:8000/v1/audio/transcriptions"
 MAX_LEN_S = 29.5  # keep under server's 30s limit
 
 def parse_args():
     p = argparse.ArgumentParser(
         description="Batch transcription to an OpenAI-compatible /v1/audio/transcriptions endpoint (with simple Silero VAD fallback)."
     )
-    p.add_argument("--url", default=DEFAULT_URL, help=f"Transcriptions endpoint (default: {DEFAULT_URL})")
+    p.add_argument("--url", default="http://localhost:8000/v1/audio/transcriptions", help=f"Transcriptions endpoint (default: http://localhost:8000/v1/audio/transcriptions)")
     p.add_argument("--indir", required=True, help="Directory with audio files.")
     p.add_argument("--outdir", required=True, help="Directory to save .txt transcripts.")
     p.add_argument("--model", default="openai/whisper-large-v3-turbo", help="Model served by vLLM.")
     p.add_argument("--language", default=None, help="Optional language code (e.g., it, en).")
     p.add_argument("--extensions", nargs="*", default=[".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"],
                    help="Audio file extensions to include.")
+    p.add_argument("-H", "--header", action="append", default=[],
+                   help="Custom header 'Key: Value'. Can be used multiple times.")
     return p.parse_args()
+
+def parse_header_args(header_args):
+    """
+    Convert ["Key: Value", "Authorization: Bearer xyz:123"] into a dict.
+    Keeps colons in values by splitting only on the first ':'.
+    """
+    headers = {}
+    for raw in header_args or []:
+        if ':' not in raw:
+            print(f"Warning: header '{raw}' missing ':'. Skipping.", file=sys.stderr)
+            continue
+        k, v = raw.split(':', 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            print(f"Warning: empty header key in '{raw}'. Skipping.", file=sys.stderr)
+            continue
+        headers[k] = v
+    return headers
 
 def find_audio_files(indir: str, exts):
     base = Path(indir)
@@ -54,16 +75,23 @@ def group_speech_segments(timestamps, max_len=MAX_LEN_S):
     return chunks
 
 async def post_one(session: aiohttp.ClientSession, url: str, model: str,
-                   language: str | None, file_path: Path) -> str:
+                   language: str | None, file_path: Path, extra_headers: dict | None) -> str:
     form = aiohttp.FormData()
     form.add_field("file", file_path.open("rb"),
                    filename=file_path.name,
                    content_type="application/octet-stream")
     form.add_field("model", model)
+    form.add_field("task", "transcribe")
     form.add_field("response_format", "json")
     if language:
         form.add_field("language", language)
-    async with session.post(url, data=form) as resp:
+
+    # Merge default + user headers
+    headers = {"accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    async with session.post(url, data=form, headers=headers) as resp:
         body = await resp.text()
         if resp.status != 200:
             # bubble up status + body for the caller to decide
@@ -76,7 +104,7 @@ async def post_one(session: aiohttp.ClientSession, url: str, model: str,
 def write_wav_slice(src: Path, start_s: float, end_s: float, dst: Path):
     """Slice [start_s, end_s] seconds to WAV using soundfile (keeps original sample rate)."""
     audio, sr = sf.read(str(src), always_2d=False)
-    if audio.ndim > 1:
+    if hasattr(audio, "ndim") and audio.ndim > 1:
         # simple mono mixdown
         import numpy as np
         audio = audio.mean(axis=1).astype(audio.dtype)
@@ -86,10 +114,11 @@ def write_wav_slice(src: Path, start_s: float, end_s: float, dst: Path):
     sf.write(str(dst), clip, sr)
 
 async def transcribe_file(session: aiohttp.ClientSession, url: str, model: str,
-                          language: str | None, src: Path, dst: Path):
+                          language: str | None, src: Path, dst: Path,
+                          extra_headers: dict | None):
     # 1) Try whole file
     try:
-        text = await post_one(session, url, model, language, src)
+        text = await post_one(session, url, model, language, src, extra_headers)
         dst.write_text(text, encoding="utf-8")
         print(f"[ok] {src.name} -> {dst.name}")
         return
@@ -115,7 +144,7 @@ async def transcribe_file(session: aiohttp.ClientSession, url: str, model: str,
                 chunk_path = tmpdir / f"chunk_{i:05d}.wav"
                 write_wav_slice(src, s, e, chunk_path)
                 try:
-                    part = await post_one(session, url, model, language, chunk_path)
+                    part = await post_one(session, url, model, language, chunk_path, extra_headers)
                     parts.append(part)
                     print(f"  [chunk {i}/{len(ranges)} ok] {chunk_path.name} ({e - s:.2f}s)")
                 except Exception as ce:
@@ -133,12 +162,14 @@ async def main_async(args):
     files = find_audio_files(args.indir, args.extensions)
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
 
+    custom_headers = parse_header_args(args.header)
+
     connector = aiohttp.TCPConnector(limit=0)  # let server handle concurrency
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = []
         for src in files:
             dst = outdir / (src.with_suffix(".txt").name)
-            tasks.append(transcribe_file(session, args.url, args.model, args.language, src, dst))
+            tasks.append(transcribe_file(session, args.url, args.model, args.language, src, dst, custom_headers))
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     ok = sum(1 for r in results if not isinstance(r, Exception))
