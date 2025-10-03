@@ -2,3 +2,4 @@
 data/*
 transcripts/
 benchmark_results.csv
+.calls
